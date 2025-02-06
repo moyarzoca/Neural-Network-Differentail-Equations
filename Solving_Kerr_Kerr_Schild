@@ -1,0 +1,186 @@
+import matplotlib.pyplot as plt
+%matplotlib inline
+import random
+import numpy as np
+import torch
+
+def gen_equal_spaced(x0,x1,num_points):
+    return torch.tensor(list(np.linspace(x0, x1, num_points)),dtype=torch.float32).view(-1,1) 
+N_net = [2,60,30,1]
+s2 = lambda x : torch.tanh(x)
+s3 = lambda x : torch.tanh(x)
+s2p = lambda x : 1 - torch.tanh(x)**2
+s3p = lambda x : 1 - torch.tanh(x)**2
+s2pp = lambda x : -2*torch.tanh(x)*(1 - torch.tanh(x)**2)
+s3pp = lambda x : -2*torch.tanh(x)*(1 - torch.tanh(x)**2)
+
+seed =  61#np.random.randint(1, int(1e5))
+#89305 
+print(seed)
+torch.manual_seed(seed)
+scale_in = 0.9
+def init_weights(shape):
+    return torch.nn.init.xavier_uniform_(torch.empty(shape))
+W21 = init_weights((N_net[1], N_net[0]))
+W32 = init_weights((N_net[2], N_net[1]))
+W43 = init_weights((N_net[3], N_net[2]))
+b2 = torch.zeros(N_net[1], 1)
+b3 = torch.zeros(N_net[2], 1)
+b4 = torch.zeros(N_net[3], 1)
+
+parameters = [W21,W32,W43,b2,b3,b4]
+for p in parameters:
+    p.requires_grad = True
+loss_tr_list = []
+loss_dev_list = []
+
+len_x = 20
+len_y = 25
+x_1_train = gen_equal_spaced(1.0, 20.0, len_x).squeeze()
+x_2_train = gen_equal_spaced(0.0, 3.1415, len_y).squeeze()
+
+x_1_dev = gen_equal_spaced(1.0+0.2, 20.0-0.2, 15).squeeze()   
+x_2_dev = gen_equal_spaced(0.0+0.2, 3.1415-0.02, 15).squeeze()
+
+x_train = torch.cartesian_prod(x_1_train,x_2_train)
+x_dev = torch.cartesian_prod(x_1_dev,x_2_dev)
+
+boundary_embedding = [torch.cartesian_prod(x_1_train[0].view(1), x_2_train),
+                      torch.cartesian_prod(x_1_train, x_2_train[0].view(1)),
+                     torch.cartesian_prod(x_1_train[-1].view(1), x_2_train),
+                     torch.cartesian_prod(x_1_train, x_2_train[-1].view(1))]
+
+BB_left = lambda xy : 2*m/(1 + rot**2*torch.cos(xy[:,1])**2)
+BB_bottom = lambda xy : 2*m*xy[:,0]/(xy[:,0]**2+rot**2)
+BB_right = lambda xy : 2*m/xy[:,0]-2*m*rot*torch.cos(xy[:,1])**2/xy[:,0]**3
+BB_top = lambda xy : 2*m*xy[:,0]/(xy[:,0]**2+rot**2)
+
+boundary_values = [BB_left(boundary_embedding[0]).view(-1,1),
+                   BB_bottom(boundary_embedding[1]).view(-1,1),
+                   BB_right(boundary_embedding[2]).view(-1,1),
+                   BB_top(boundary_embedding[3]).view(-1,1)]
+
+boundary_conditions = torch.cat(boundary_embedding,dim=0),torch.cat(boundary_values,dim=0),len_x,len_y
+
+def compute_loss(x_inp, boundary_conditions, param, N_net):
+    [W21,W32,W43,b2,b3,b4]=param
+    boundary_emb, boundary_val, len_x,len_y = boundary_conditions
+    x_run = torch.cat([x_inp, boundary_emb], dim=0)
+    
+    x = x_run.T
+    z2 = W21 @ x  + b2
+    a2 = s2(z2)
+    z3 = W32 @ a2 + b3
+    a3 = s3(z3)
+    z4 = W43 @ a3 + b4
+    f_all = z4
+
+    shift_boundary_label = 2*len_x+2*len_y
+    f_input = f_all[:,:-shift_boundary_label]
+    f_boundary = f_all[:,-shift_boundary_label:].T
+
+    loss_boundary = ((f_boundary-boundary_val)**2).mean()
+
+    
+    J2_1 = W21[:,0:1]
+    J3_1 = W32 @ (s2p(z2)*J2_1)
+    J4_1 = W43 @ (s3p(z3)*J3_1)
+    fp_1 = J4_1
+
+    J2_2 = W21[:,1:2]
+    J3_2 = W32 @ (s2p(z2)*J2_2)
+    J4_2 = W43 @ (s3p(z3)*J3_2)
+    fp_2 = J4_2
+
+    K3_11 = W32 @ (s2pp(z2)*J2_1*J2_1)
+    K4_11 = W43 @ (s3pp(z3)*J3_1*J3_1 + s3p(z3)*K3_11)
+    fpp_11 = K4_11
+
+    K3_22 = W32 @ (s2pp(z2)*J2_2*J2_2)
+    K4_22 = W43 @ (s3pp(z3)*J3_2*J3_2 + s3p(z3)*K3_22)
+    fpp_22 = K4_22
+    
+    EDO = ((x[0]**2 + rot**2*torch.cos(x[1])**2)*fpp_11 + 4*x[0]*fp_1 + 2*f_all).squeeze()
+    loss = (EDO**2).mean() + loss_boundary
+    #globals().update(locals()) 
+    return loss
+def compute_f(x_inp, param, N_net):
+    [W21,W32,W43,b2,b3,b4]=param
+    x = x_inp.T
+    z2 = W21 @ x  + b2
+    a2 = s2(z2)
+    z3 = W32 @ a2 + b3
+    a3 = s3(z3)
+    z4 = W43 @ a3 + b4
+    f = z4
+    return f
+
+visual_train = []
+for cuenta in range(3000):
+    x_train_cycle = x_train #+ pert_generator(-0.01,0.01,len(x_train)) #pert_generator(1,20,len(x_train))#
+    x_dev_cycle = x_dev #+ pert_generator(-0.01,0.01,len(x_dev))
+    
+    loss_dev = compute_loss(x_dev_cycle, boundary_conditions, parameters, N_net)
+    loss_dev_list.append(loss_dev.item())
+    
+    loss_run = compute_loss(x_train_cycle, boundary_conditions, parameters, N_net)
+    loss_tr_list.append(loss_run.item())
+    
+    for p in parameters[:]:
+        p.grad = None
+    loss_run.backward()
+    for p in parameters[:]:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        lr = 0.01
+        p.data += -lr*p.grad
+print("train loss = ",loss_run.data,"   dev loss = ",loss_dev.data)
+
+#Plot of the loss function
+plt.plot(range(len(loss_dev_list)),loss_dev_list)
+plt.plot(range(len(loss_tr_list)),loss_tr_list)
+plt.yscale("log")
+plt.show()
+
+#Contour plot of the Neural Network solution comparing with the analytic solution of Kerr
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))  # 1 row, 2 columns
+
+def F_ana(x,y):
+    return 2*m*x/(x**2+rot**2*np.cos(y)**2)
+
+contour1 = axes[0].contour(X, Y, ZZ, levels=20, cmap='viridis')
+fig.colorbar(contour1, ax=axes[0])
+axes[0].set_title("Neural Network solution Kerr a = 2")
+axes[0].set_xlabel("x")
+axes[0].set_ylabel("y")
+
+contour2 = axes[1].contour(X, Y, F_ana(X,Y), levels=20, cmap='viridis')
+fig.colorbar(contour2, ax=axes[1])
+axes[1].set_title("Analytic solution Contour Plot  Kerr a = 2")
+axes[1].set_xlabel("x")
+axes[1].set_ylabel("y")
+
+plt.tight_layout()
+plt.show()
+
+#3D version plot of the previous
+
+from mpl_toolkits.mplot3d import Axes3D
+
+
+    
+# Create 3D plot
+fig = plt.figure(figsize=(8, 6))
+ax = fig.add_subplot(111, projection='3d')
+
+ax.plot_surface(X, Y, F_ana(X,Y), cmap='plasma',alpha=0.6)
+ax.plot_surface(X, Y, ZZ, cmap='viridis')
+
+ax.set_xlabel(f'radial coordinate $r$')
+ax.set_ylabel(f'angle theta')
+ax.set_zlabel('f(X, Y)')
+ax.set_title('Green/Purple: Neural Network\nYellow/Purple: Analytic solution ')
+
+plt.show()
+
